@@ -1,0 +1,277 @@
+/*******************************
+ REGION EXTRACTION: Cerro Gordo County, Iowa
+********************************/
+var countySet = ee.FeatureCollection('TIGER/2018/Counties');
+var countyChosen = countySet.filter(ee.Filter.eq('GEOID', '19033'));
+var roi = countyChosen.geometry();
+
+Map.centerObject(roi, 12);
+Map.addLayer(roi, {color: 'red'}, 'AOI', false);
+
+
+/*******************************
+1. Training data
+   The process begins with satellite embeddings for the selected region. 
+   A cropland mask is applied so that only cultivated areas remain.
+   Pixel samples are taken to form a training FeatureCollection, where each sample holds the embedding band values.
+   This collection serves as the training data set.
+
+2. Model training
+   The Cascade KMeans clusterer is used to group the training samples into four or five natural clusters.
+   This is an unsupervised method, meaning no crop labels are provided and only the embedding features guide the grouping.
+   The model learns characteristic patterns that represent each cluster.
+
+3. Prediction
+   Once trained, the model is applied to the full image of cultivated land.
+   Every pixel is assigned to a cluster identifier such as 0, 1, or 2.
+   At this point the cluster numbers have no agricultural meaning yet.
+   This step represents the prediction phase.
+
+4. Assigning crop labels
+   For the training year, the dominant CDL class within each cluster is determined using a majority vote.
+   This produces a mapping from cluster identifier to crop type, where corn is 1, soybean is 2, and all others are 0.
+   This mapping is then applied to the clusters of the test year so that each pixel receives an actual crop label.
+
+5. Validation
+   The test year CDL is used as a reference and is simplified to corn as 1, soybean as 2, and other crops as 0.
+   A confusion matrix and a value for R squared are computed using only the pixels labeled as corn or soybean.
+   This serves as the evaluation stage.
+
+6. Train and test years
+   The workflow separates training and testing by using different years, for example training on 2021 and testing on 2022.
+   This approach evaluates how well the method generalizes across seasons.
+/
+
+/*******************************
+ SETTINGS
+********************************/
+var yrTrain = 2021;
+var yrTest  = 2022;
+var kLow = 4;
+var kHigh = 5;
+
+var CDL_ID_CORN = 1;
+var CDL_ID_SOY  = 5;
+
+var visCrop = {min: 0, max: 2, palette: ['#bdbdbd', '#ffd400', '#267300']};
+
+
+/*******************************
+ UTILITIES
+********************************/
+function rangeFromYear(yearNum) {
+  var startDate = ee.Date.fromYMD(yearNum, 1, 1);
+  return {
+    start: startDate,
+    end: startDate.advance(1, 'year')
+  };
+}
+
+function fetchEmbeddingAnnual(yearNum, area) {
+  var period = rangeFromYear(yearNum);
+  return ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+    .filter(ee.Filter.date(period.start, period.end))
+    .filterBounds(area)
+    .mosaic();
+}
+
+function loadCdlAssets(yearNum, area) {
+  var period = rangeFromYear(yearNum);
+  var cdlImg = ee.ImageCollection('USDA/NASS/CDL')
+      .filter(ee.Filter.date(period.start, period.end))
+      .first();
+
+  var croplandLayer = cdlImg.select('cropland');
+  var cultivatedMask = cdlImg.select('cultivated').eq(2).rename('cultMask');
+
+  var allClasses = ee.List.sequence(0, 254);
+  var newValues  = ee.List.repeat(0, 255)
+    .set(CDL_ID_CORN, 1)
+    .set(CDL_ID_SOY, 2);
+
+  var cdlReduced = croplandLayer
+    .remap(allClasses, newValues)
+    .rename('cropCode');
+
+  return {
+    src: cdlImg,
+    cropland: croplandLayer,
+    cultMask: cultivatedMask,
+    cdlSimple: cdlReduced
+  };
+}
+
+function pickTrainingSamples(image, area, scaleVal, pointCount, seedVal) {
+  return image.sample({
+    region: area,
+    scale: scaleVal,
+    numPixels: pointCount,
+    seed: seedVal,
+    tileScale: 4,
+    geometries: false
+  });
+}
+
+function buildClusterLabelLookup(clusterImg, referenceImg, area, scaleVal, nPts) {
+  var joined = referenceImg.addBands(clusterImg).sample({
+    region: area,
+    scale: scaleVal,
+    numPixels: nPts,
+    seed: 7,
+    geometries: false,
+    tileScale: 4
+  });
+
+  var idList = ee.List(joined.aggregate_array('cluster').distinct());
+
+  var mappingList = idList.map(function(clusterVal) {
+    clusterVal = ee.Number(clusterVal);
+    var subset = joined.filter(ee.Filter.eq('cluster', clusterVal));
+    var histogram = ee.Dictionary(subset.aggregate_histogram('cropCode'));
+
+    var keys = histogram.keys();
+    var vals = histogram.values();
+    var empty = ee.Algorithms.IsEqual(keys.length(), 0);
+
+    var chosen = ee.Number(ee.Algorithms.If(
+      empty,
+      0,
+      (function() {
+        var maxVal = ee.Number(vals.reduce(ee.Reducer.max()));
+        var idx = ee.List(vals).indexOf(maxVal);
+        return ee.Number.parse(keys.get(idx));
+      })()
+    ));
+
+    return ee.Feature(null, {cluster: clusterVal, label: chosen});
+  });
+
+  var fcMap = ee.FeatureCollection(mappingList);
+  var ids = ee.List(fcMap.aggregate_array('cluster'));
+  var labels = ee.List(fcMap.aggregate_array('label'));
+
+  return {
+    ids: ids,
+    labels: labels,
+    table: fcMap
+  };
+}
+
+
+/*******************************
+ TRAIN YEAR PROCESSING
+********************************/
+var embedTrain = fetchEmbeddingAnnual(yrTrain, roi);
+var cdlTrainSet = loadCdlAssets(yrTrain, roi);
+
+var embMaskedTrain = embedTrain.updateMask(cdlTrainSet.cultMask);
+
+var samplesTrain = pickTrainingSamples(embMaskedTrain, roi, 10, 5000, 591);
+
+var kmCascade = ee.Clusterer.wekaCascadeKMeans({
+  minClusters: kLow,
+  maxClusters: kHigh
+}).train({
+  features: samplesTrain,
+  inputProperties: embMaskedTrain.bandNames()
+});
+
+var clusterTrain = embMaskedTrain.cluster(kmCascade).rename('cluster');
+
+var refTrainImg = cdlTrainSet.cdlSimple
+  .updateMask(cdlTrainSet.cultMask)
+  .updateMask(cdlTrainSet.cdlSimple.gt(0))
+  .rename('cropCode')
+  .toInt();
+
+var labelMap = buildClusterLabelLookup(clusterTrain, refTrainImg, roi, 30, 20000);
+print('Cluster to label table:', labelMap.table);
+
+var predTrainYear = clusterTrain.remap(labelMap.ids, labelMap.labels, 0)
+  .rename('predicted')
+  .toInt();
+
+
+/*******************************
+ APPLY TO TEST YEAR
+********************************/
+var embedTest = fetchEmbeddingAnnual(yrTest, roi);
+var cdlTestSet = loadCdlAssets(yrTest, roi);
+
+var embMaskedTest = embedTest.updateMask(cdlTestSet.cultMask);
+
+var clusterTest = embMaskedTest.cluster(kmCascade).rename('cluster');
+
+var predTestYear = clusterTest.remap(labelMap.ids, labelMap.labels, 0)
+  .rename('pred')
+  .toInt();
+
+
+/*******************************
+ VALIDATION
+********************************/
+var refTestImg = cdlTestSet.cdlSimple
+  .updateMask(cdlTestSet.cultMask)
+  .updateMask(cdlTestSet.cdlSimple.gt(0))
+  .rename('ref')
+  .toInt();
+
+var validMask = refTestImg.mask().and(predTestYear.mask());
+var refEval = refTestImg.updateMask(validMask);
+var predEval = predTestYear.updateMask(validMask);
+
+var testSamples = refEval.addBands(predEval).stratifiedSample({
+  numPoints: 4000,
+  classBand: 'ref',
+  classValues: [1, 2],
+  classPoints: [2000, 2000],
+  region: roi,
+  scale: 30,
+  seed: 101,
+  geometries: false,
+  tileScale: 4
+});
+
+var cm = testSamples.errorMatrix('ref', 'pred');
+print('Confusion Matrix:', cm);
+print('Overall Accuracy:', cm.accuracy());
+print('Kappa:', cm.kappa());
+print('Producer Accuracy:', cm.producersAccuracy());
+print('User Accuracy:', cm.consumersAccuracy());
+
+var baseProj = refEval.projection();
+var paired = ee.Image.cat([
+  refEval.reproject({crs: baseProj}),
+  predEval.reproject({crs: baseProj})
+]);
+
+var corr = paired.reduceRegion({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e10
+});
+
+var rVal = ee.Number(ee.Dictionary(corr).values().get(0));
+print('Pearson r:', rVal);
+print('R²:', rVal.pow(2));
+
+
+/*******************************
+ MAP DISPLAY
+********************************/
+Map.addLayer(predEval.clip(roi), visCrop, 'Predicted Crop Map ' + yrTest);
+Map.addLayer(refEval.clip(roi), visCrop, 'CDL Reference ' + yrTest, false);
+
+var legendPanel = ui.Panel({style: {position: 'bottom-center', padding: '6px'}});
+function legendEntry(color, label) {
+  var box = ui.Label({style: {backgroundColor: color, padding: '10px', margin: '0 4px 4px 0'}});
+  var lab = ui.Label({value: label, style: {margin: '6px 10px 0 2px'}});
+  return ui.Panel({widgets: [box, lab], layout: ui.Panel.Layout.Flow('horizontal')});
+}
+
+legendPanel.add(ui.Label({value: 'Legend', style: {fontWeight: 'bold', fontSize: '16px'}}));
+legendPanel.add(legendEntry('#ffd400', 'Corn'));
+legendPanel.add(legendEntry('#267300', 'Soybean'));
+legendPanel.add(legendEntry('#bdbdbd', 'Other'));
+Map.add(legendPanel);
